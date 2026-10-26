@@ -1,0 +1,218 @@
+/* Layer order must be declared before importing tailwindcss so the Clerk
+ * styles (loaded via @clerk/themes/shadcn.css) sit between base + components
+ * and apply correctly in both dev and prod builds. */
+@layer theme, base, clerk, components, utilities;
+@import "tailwindcss";
+@import "@clerk/themes/shadcn.css";
+@import "tw-animate-css";
+@plugin "@tailwindcss/typography";
+
+@import '@fontsource/merriweather/400.css';
+@import '@fontsource/merriweather/400-italic.css';
+@import '@fontsource/merriweather/700.css';
+@import '@fontsource/lora/400.css';
+@import '@fontsource/lora/400-italic.css';
+@import '@fontsource/lora/600.css';
+@import '@fontsource/crimson-pro/400.css';
+@import '@fontsource/crimson-pro/400-italic.css';
+@import '@fontsource/crimson-pro/600.css';
+@import '@fontsource/plus-jakarta-sans/400.css';
+@import '@fontsource/plus-jakarta-sans/500.css';
+@import '@fontsource/plus-jakarta-sans/700.css';
+
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-card-border: hsl(var(--card-border));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-popover-border: hsl(var(--popover-border));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-primary-border: var(--primary-border);
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-secondary-border: var(--secondary-border);
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-muted-border: var(--muted-border);
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-accent-border: var(--accent-border);
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-destructive-border: var(--destructive-border);
+
+  --font-sans: var(--app-font-sans);
+  --font-serif: var(--app-font-serif);
+  --font-mono: var(--app-font-mono);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --button-outline: rgba(0,0,0, .10);
+  --badge-outline: rgba(0,0,0, .05);
+  --opaque-button-border-intensity: -8;
+  --elevate-1: rgba(0,0,0, .03);
+  --elevate-2: rgba(0,0,0, .08);
+
+  /* Lyra cyan-family palette (light) */
+  --background: 200 18% 98%; /* clean cool off-white */
+  --foreground: 215 28% 14%; /* deep cool slate */
+
+  --border: 210 20% 88%;
+  --input: 210 20% 88%;
+  --ring: 187 92% 42%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 215 28% 14%;
+  --card-border: 210 20% 88%;
+
+  --sidebar: 200 18% 98%;
+  --sidebar-foreground: 215 28% 14%;
+  --sidebar-border: 210 20% 88%;
+  --sidebar-primary: 187 92% 38%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 187 55% 94%;
+  --sidebar-accent-foreground: 195 80% 22%;
+  --sidebar-ring: 187 92% 42%;
+
+  --popover: 0 0% 100%;
+  --popover-foreground: 215 28% 14%;
+  --popover-border: 210 20% 88%;
+
+  --primary: 187 92% 38%; /* vivid cyan, anchor brand colour */
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 320 88% 55%; /* magenta — the emotional brand accent */
+  --secondary-foreground: 0 0% 100%;
+
+  --muted: 210 20% 94%;
+  --muted-foreground: 215 14% 42%;
+
+  --accent: 187 65% 93%; /* pale cyan wash for hovers */
+  --accent-foreground: 195 80% 22%;
+
+  --destructive: 0 72% 50%;
+  --destructive-foreground: 0 0% 100%;
+
+  --chart-1: 187 92% 42%;
+  --chart-2: 195 75% 28%;
+  --chart-3: 175 70% 38%;
+  --chart-4: 200 50% 60%;
+  --chart-5: 215 30% 50%;
+
+  --app-font-sans: 'Plus Jakarta Sans', sans-serif;
+  --app-font-serif: 'Merriweather', serif;
+  --app-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  
+  --radius: 0.5rem;
+  --shadow-2xs: 0px 2px 0px 0px rgba(44, 40, 37, 0.05);
+  --shadow-xs: 0px 2px 0px 0px rgba(44, 40, 37, 0.05);
+  --shadow-sm: 0px 2px 0px 0px rgba(44, 40, 37, 0.05), 0px 1px 2px -1px rgba(44, 40, 37, 0.05);
+  --shadow: 0px 2px 0px 0px rgba(44, 40, 37, 0.05), 0px 1px 2px -1px rgba(44, 40, 37, 0.05);
+  --shadow-md: 0px 2px 0px 0px rgba(44, 40, 37, 0.05), 0px 2px 4px -1px rgba(44, 40, 37, 0.05);
+  --shadow-lg: 0px 2px 0px 0px rgba(44, 40, 37, 0.05), 0px 4px 6px -1px rgba(44, 40, 37, 0.05);
+  --shadow-xl: 0px 2px 0px 0px rgba(44, 40, 37, 0.05), 0px 8px 10px -1px rgba(44, 40, 37, 0.05);
+  --shadow-2xl: 0px 2px 0px 0px rgba(44, 40, 37, 0.05);
+
+  --primary-border: hsl(from hsl(var(--primary)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --secondary-border: hsl(from hsl(var(--secondary)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --muted-border: hsl(from hsl(var(--muted)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --accent-border: hsl(from hsl(var(--accent)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --destructive-border: hsl(from hsl(var(--destructive)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+}
+
+.dark {
+  --button-outline: rgba(255,255,255, .10);
+  --badge-outline: rgba(255,255,255, .05);
+  --opaque-button-border-intensity: 9;
+  --elevate-1: rgba(255,255,255, .04);
+  --elevate-2: rgba(255,255,255, .09);
+
+  /* Lyra cyan-family palette (dark) — teal-tinted near-black so the cyan glows. */
+  --background: 210 28% 7%;
+  --foreground: 200 15% 92%;
+
+  --border: 210 20% 18%;
+  --input: 210 20% 18%;
+  --ring: 187 90% 55%;
+
+  --card: 210 28% 10%;
+  --card-foreground: 200 15% 92%;
+  --card-border: 210 20% 18%;
+
+  --sidebar: 210 28% 7%;
+  --sidebar-foreground: 200 15% 92%;
+  --sidebar-border: 210 20% 18%;
+  --sidebar-primary: 187 90% 55%;
+  --sidebar-primary-foreground: 210 30% 8%;
+  --sidebar-accent: 200 25% 16%;
+  --sidebar-accent-foreground: 187 80% 78%;
+  --sidebar-ring: 187 90% 55%;
+
+  --popover: 210 28% 10%;
+  --popover-foreground: 200 15% 92%;
+  --popover-border: 210 20% 18%;
+
+  --primary: 187 90% 55%; /* bright cyan glows on dark */
+  --primary-foreground: 210 30% 8%;
+
+  --secondary: 320 90% 65%; /* lifted magenta for dark mode */
+  --secondary-foreground: 210 30% 8%;
+
+  --muted: 210 22% 14%;
+  --muted-foreground: 210 14% 62%;
+
+  --accent: 200 25% 16%;
+  --accent-foreground: 187 80% 78%;
+
+  --destructive: 0 65% 55%;
+  --destructive-foreground: 0 0% 100%;
+
+  --chart-1: 187 90% 55%;
+  --chart-2: 195 65% 45%;
+  --chart-3: 175 65% 50%;
+  --chart-4: 200 50% 65%;
+  --chart-5: 215 30% 65%;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+  }
+}
+
+@layer utilities {
+  /* Lyra aurora — cyan → purple → magenta. Use sparingly: reserve for the
+     mark, the wordmark, and at most one hero word per page. */
+  .text-aurora {
+    background-image: linear-gradient(120deg, #22D3EE 0%, #A855F7 50%, #EC4899 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+  }
+}

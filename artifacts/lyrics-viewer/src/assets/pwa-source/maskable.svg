@@ -1,0 +1,25 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="lyraGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22D3EE"/>
+      <stop offset="50%" stop-color="#A855F7"/>
+      <stop offset="100%" stop-color="#EC4899"/>
+    </linearGradient>
+    <radialGradient id="centreGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#F0ABFC" stop-opacity="0.55"/>
+      <stop offset="60%" stop-color="#A855F7" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- Maskable icon: dark fill bleeds to every edge so the OS can mask any shape (circle, squircle, rounded square). The mark sits inside the safe zone (~60% of canvas). -->
+  <rect width="512" height="512" fill="#0A0F1F"/>
+  <g transform="translate(256 256) scale(3.6)">
+    <circle cx="0" cy="0" r="22" fill="url(#centreGlow)"/>
+    <g fill="none" stroke="url(#lyraGrad)" stroke-width="3.25" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M0 0 C -6 -10, 6 -20, 18 -18 C 20 -6, 10 6, 0 0 Z"/>
+      <path d="M0 0 C -6 -10, 6 -20, 18 -18 C 20 -6, 10 6, 0 0 Z" transform="rotate(90)"/>
+      <path d="M0 0 C -6 -10, 6 -20, 18 -18 C 20 -6, 10 6, 0 0 Z" transform="rotate(180)"/>
+      <path d="M0 0 C -6 -10, 6 -20, 18 -18 C 20 -6, 10 6, 0 0 Z" transform="rotate(270)"/>
+    </g>
+    <circle cx="0" cy="0" r="3.6" fill="#F0ABFC"/>
+  </g>
+</svg>

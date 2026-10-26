@@ -1,0 +1,112 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: me
+    description: Current user's data
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /me/data:
+    get:
+      operationId: getMyData
+      tags: [me]
+      summary: Get the current user's lyra data snapshot
+      description: |
+        Returns the signed-in singer's per-account data: setlists, stage
+        overrides, song notes, favourites, and song keys. Returns an empty
+        snapshot for first-time users.
+      responses:
+        "200":
+          description: User data snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserDataSnapshot"
+        "401":
+          description: Not signed in
+    put:
+      operationId: putMyData
+      tags: [me]
+      summary: Replace the current user's lyra data snapshot
+      description: |
+        Last-writer-wins replacement of the signed-in singer's per-account
+        data. The server validates basic shape and per-slice size limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserDataSnapshot"
+      responses:
+        "200":
+          description: Updated snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserDataSnapshot"
+        "400":
+          description: Invalid data shape
+        "401":
+          description: Not signed in
+        "413":
+          description: Snapshot exceeds size limits
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    # Per-user snapshot. Slices are intentionally loosely-typed (object/array
+    # of unknown) — the React client owns the exact field shapes via its
+    # in-app TS types, and the server validates basic JSON-ness + size.
+    UserDataSnapshot:
+      type: object
+      required:
+        - setlists
+        - setlistOverrides
+        - songNotes
+        - favorites
+        - songKeys
+      properties:
+        setlists:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        setlistOverrides:
+          type: object
+          additionalProperties: true
+        songNotes:
+          type: object
+          additionalProperties: true
+        favorites:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        songKeys:
+          type: object
+          additionalProperties: true

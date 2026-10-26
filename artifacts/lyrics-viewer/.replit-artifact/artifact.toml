@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Lyrics Viewer"
+version = "1.0.0"
+id = "artifacts/lyrics-viewer"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22547
+
+[services.development]
+run = "pnpm --filter @workspace/lyrics-viewer run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/lyrics-viewer", "run", "build" ]
+publicDir = "artifacts/lyrics-viewer/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22547"
+BASE_PATH = "/"

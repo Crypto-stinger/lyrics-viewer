@@ -1,0 +1,7 @@
+Complete project source export
+
+Includes application source, API server, shared libraries, database schema, package manifests and lockfile, project configuration, and project assets.
+
+Excludes secrets, installed dependencies, generated build output, internal agent files, Git history, and live database records.
+
+Install dependencies with pnpm install. The project uses Node.js 24. Service credentials and a PostgreSQL database must be configured separately. Existing Replit workflow and artifact configurations are included where present. Running outside Replit requires equivalent routing and environment configuration.
