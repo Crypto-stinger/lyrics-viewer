@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
-import { ListMusic, Plus, Trash2, ChevronUp, ChevronDown, ArrowRight, Pencil, Loader2, Music, NotebookPen, Wand2 } from "lucide-react";
+import { ListMusic, Plus, Trash2, ChevronUp, ChevronDown, ArrowRight, Pencil, Loader2, Music, NotebookPen, Wand2, Lock, LogIn } from "lucide-react";
+import { Link } from "wouter";
+import { useAuth } from "@clerk/react";
+import { useLyraData } from "@/hooks/use-lyra-data";
 import { Layout } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,6 +14,41 @@ import { useSetlistOverrides } from "@/hooks/use-setlist-overrides";
 import { fetchLyrics } from "@/lib/lyrics";
 
 export default function SetlistsPage() {
+  const { isLoaded } = useAuth();
+  const { canUseSetlists } = useLyraData();
+  if (!canUseSetlists) {
+    return (
+      <Layout>
+        <div className="flex-1 w-full max-w-3xl mx-auto px-4 py-12">
+          <h1 className="font-serif text-3xl sm:text-4xl font-bold text-foreground">Setlists</h1>
+          {!isLoaded ? (
+            <div className="mt-10 flex items-center gap-3 text-muted-foreground" data-testid="setlists-loading">
+              <Loader2 className="w-5 h-5 animate-spin" /> Checking your account…
+            </div>
+          ) : (
+            <div className="mt-10 bg-card border border-card-border rounded-2xl p-8 text-center space-y-4" data-testid="setlists-signed-out">
+              <Lock className="w-8 h-8 text-primary mx-auto" />
+              <p className="text-lg font-semibold text-foreground">Your setlists are private</p>
+              <p className="text-sm text-muted-foreground max-w-md mx-auto">
+                Sign in to see and build your setlists. They're saved to your account, so they're on every device you sign in on — and nobody else can see them.
+              </p>
+              <Link
+                href="/sign-in"
+                data-testid="link-setlists-sign-in"
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground font-medium hover:opacity-90"
+              >
+                <LogIn className="w-4 h-4" /> Sign in
+              </Link>
+            </div>
+          )}
+        </div>
+      </Layout>
+    );
+  }
+  return <SetlistsContent />;
+}
+
+function SetlistsContent() {
   const { setlists, createSetlist, renameSetlist, deleteSetlist, removeSong, moveSong } = useSetlists();
   const { setCurrentSong } = useCurrentSong();
   const { hasNotes } = useSongNotes();

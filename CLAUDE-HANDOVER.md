@@ -6,6 +6,9 @@
 - Always start in dark mode on a fresh load or refresh. The light-mode toggle remains available for the current session.
 - Keep live-band cue following, manual line correction, and conservative confidence scoring.
 - Do not run MediaRecorder/getUserMedia alongside browser speech recognition.
+- Setlists (and their per-gig stage versions) are private to each account: never show them signed out, and never store a signed-in user's setlists in the shared signed-out localStorage keys (they live in the account and in a per-user cache `lyra:user-cache:<userId>`).
+- Sign-in is tied to the bare domain lyricviewer.com; www.lyricviewer.com redirects to it. Google sign-in returns via `/sso-callback` or `/sign-in/sso-callback`, both of which finish the sign-in instead of showing "page not found".
+- The app is being moved off Replit to Render. Keep `render.yaml`, `SERVE_WEB` support in the API server (`src/lib/web-app.ts`) and `src/lib/ensure-schema.ts` working. See MOVE-TO-RENDER.md.
 
 ## Integrated work
 

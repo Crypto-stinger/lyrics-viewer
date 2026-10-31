@@ -10,6 +10,7 @@ import {
 } from "./middlewares/clerkProxyMiddleware";
 import router from "./routes";
 import { logger } from "./lib/logger";
+import { mountWebApp, redirectWww } from "./lib/web-app";
 
 const app: Express = express();
 
@@ -33,6 +34,11 @@ app.use(
   }),
 );
 
+// Behind Render / other hosts' load balancers, trust X-Forwarded-* so
+// req.ip, req.protocol and rate limiting see the real client.
+app.set("trust proxy", 1);
+app.use(redirectWww);
+
 // Clerk proxy must be mounted before body parsers — it streams raw bytes
 // for the Clerk frontend SDK to talk to Clerk's backend through our domain.
 app.use(CLERK_PROXY_PATH, clerkProxyMiddleware());
@@ -47,12 +53,15 @@ app.use(express.urlencoded({ extended: true }));
 app.use(
   clerkMiddleware((req) => ({
     publishableKey: publishableKeyFromHost(
-      getClerkProxyHost(req) ?? "",
+      (getClerkProxyHost(req) ?? "").replace(/^www\./, ""),
       process.env.CLERK_PUBLISHABLE_KEY,
     ),
   })),
 );
 
 app.use("/api", router);
+
+// When running as a single service (Render etc.), also serve the web app.
+mountWebApp(app);
 
 export default app;

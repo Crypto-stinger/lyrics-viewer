@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Switch, Route, Router as WouterRouter, useLocation } from "wouter";
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
-import { ClerkProvider, SignIn, SignUp, useClerk } from "@clerk/react";
+import { AuthenticateWithRedirectCallback, ClerkProvider, SignIn, SignUp, useClerk } from "@clerk/react";
 import { publishableKeyFromHost } from "@clerk/react/internal";
 import { shadcn } from "@clerk/themes";
 import { Toaster } from "@/components/ui/toaster";
@@ -18,16 +18,34 @@ import { PwaStatus } from "@/components/pwa-status";
 import { PrecacheProvider } from "@/hooks/use-precache-songs";
 import { Logo } from "@/components/logo";
 
+// One canonical address. Sign-in is tied to the bare domain (lyricviewer.com):
+// on www.lyricviewer.com the sign-in key below would be derived for
+// "clerk.www.lyricviewer.com", which doesn't exist, and Google sign-in fails.
+if (typeof window !== "undefined" && window.location.hostname.startsWith("www.")) {
+  const { protocol, hostname, port, pathname, search, hash } = window.location;
+  window.location.replace(
+    `${protocol}//${hostname.slice(4)}${port ? `:${port}` : ""}${pathname}${search}${hash}`,
+  );
+}
+
 // Resolve Clerk publishable key from window.location.hostname so the same build
 // can serve multiple Clerk custom domains; fall back to the env-injected key
 // during development.
 const clerkPubKey = publishableKeyFromHost(
-  typeof window !== "undefined" ? window.location.hostname : "",
+  typeof window !== "undefined" ? window.location.hostname.replace(/^www\./, "") : "",
   import.meta.env.VITE_CLERK_PUBLISHABLE_KEY,
 );
 
-// In dev this env var is empty; in prod it's auto-set.
-const clerkProxyUrl = import.meta.env.VITE_CLERK_PROXY_URL as string | undefined;
+// Sign-in traffic goes through our own server at /api/__clerk (see the API
+// server's clerkProxyMiddleware). Replit sets this automatically; anywhere
+// else (e.g. Render) it defaults to this site's own /api/__clerk in production.
+// Clerk development keys (pk_test_…) don't use the proxy — handy for testing
+// on a temporary address such as lyra.onrender.com before the domain moves.
+const clerkProxyUrl =
+  (import.meta.env.VITE_CLERK_PROXY_URL as string | undefined) ||
+  (import.meta.env.PROD && typeof window !== "undefined" && !clerkPubKey.startsWith("pk_test_")
+    ? `${window.location.origin}/api/__clerk`
+    : undefined);
 
 const basePath = import.meta.env.BASE_URL.replace(/\/$/, "");
 
@@ -142,6 +160,21 @@ function SignUpPage() {
   );
 }
 
+// Where Google (and other social logins) send the browser back to. Clerk
+// finishes the sign-in here and then goes to the home page. Kept as its own
+// route so a return trip never lands on the "page not found" screen.
+function SsoCallbackPage() {
+  return (
+    <AuthShell>
+      <p className="text-sm text-slate-300" data-testid="text-finishing-sign-in">Finishing sign-in…</p>
+      <AuthenticateWithRedirectCallback
+        signInFallbackRedirectUrl={basePath || "/"}
+        signUpFallbackRedirectUrl={basePath || "/"}
+      />
+    </AuthShell>
+  );
+}
+
 // Clear react-query cache when the signed-in user changes so one user's data
 // never leaks into another's session.
 function ClerkQueryCacheInvalidator() {
@@ -170,6 +203,7 @@ function AppRoutes() {
       <Route path="/view" component={ViewPage} />
       <Route path="/favorites" component={FavoritesPage} />
       <Route path="/setlists" component={SetlistsPage} />
+      <Route path="/sso-callback" component={SsoCallbackPage} />
       <Route component={NotFound} />
     </Switch>
   );
@@ -184,11 +218,14 @@ function ClerkProviderWithRoutes() {
       appearance={clerkAppearance}
       signInUrl={`${basePath}/sign-in`}
       signUpUrl={`${basePath}/sign-up`}
+      signInFallbackRedirectUrl={basePath || "/"}
+      signUpFallbackRedirectUrl={basePath || "/"}
+      afterSignOutUrl={basePath || "/"}
       localization={{
         signIn: {
           start: {
             title: "Welcome back",
-            subtitle: "Sign in to sync your setlists, notes and favourites across devices.",
+            subtitle: "Sign in to see your setlists and sync your notes and favourites across devices.",
           },
         },
         signUp: {
