@@ -125,6 +125,37 @@ function writeLocalSnapshot(d: LyraData): void {
   writeJson(KEYS.songKeys, d.songKeys);
 }
 
+// Setlists (and their per-gig stage versions) are private to each account.
+// They are never shown to a signed-out visitor, and a signed-in user's copy is
+// cached on the device under their own user id — never in the shared
+// anonymous keys, so the next person to use the device (signed out, or signed
+// in as someone else) can't see or inherit them.
+const USER_CACHE_PREFIX = "lyra:user-cache:";
+const LAST_USER_KEY = "lyra:last-user";
+const DIRTY_PREFIX = "lyra:user-cache-dirty:";
+
+function withoutPrivate(d: LyraData): LyraData {
+  return { ...d, setlists: [], setlistOverrides: {} };
+}
+
+function readUserCache(userId: string): LyraData | null {
+  const cached = readJson<LyraData | null>(USER_CACHE_PREFIX + userId, null);
+  return cached ? { ...EMPTY_DATA, ...cached } : null;
+}
+
+function writeUserCache(userId: string, d: LyraData): void {
+  writeJson(USER_CACHE_PREFIX + userId, d);
+  try { localStorage.setItem(LAST_USER_KEY, userId); } catch { /* ignore */ }
+}
+
+/** Remove legacy anonymous setlists once they've been moved into an account. */
+function clearAnonymousPrivate(): void {
+  try {
+    localStorage.removeItem(KEYS.setlists);
+    localStorage.removeItem(KEYS.setlistOverrides);
+  } catch { /* ignore */ }
+}
+
 function isEmptySnapshot(d: LyraData): boolean {
   return (
     d.setlists.length === 0 &&
@@ -146,6 +177,9 @@ interface LyraDataContextValue {
    *  resolved or localStorage hydrated). Prevents flash-of-empty for hooks
    *  that render lists. */
   isReady: boolean;
+  /** True when setlists are available (signed in, or offline with this
+   *  device's last account). Setlists are private to an account. */
+  canUseSetlists: boolean;
 }
 
 const LyraDataContext = createContext<LyraDataContextValue | undefined>(undefined);
@@ -154,6 +188,21 @@ export function LyraDataProvider({ children }: { children: ReactNode }) {
   const { isLoaded, isSignedIn, userId } = useAuth();
   const { toast } = useToast();
   const queryClient = useQueryClient();
+
+  // Offline at a gig, the sign-in service may not load at all. If that happens
+  // and this device was last used signed in, fall back to that account's
+  // on-device copy so the singer still has their setlists on stage.
+  const [offlineUserId, setOfflineUserId] = useState<string | null>(null);
+  const [offlineEdits, setOfflineEdits] = useState(0);
+  useEffect(() => {
+    if (isLoaded) { setOfflineUserId(null); return; }
+    const t = window.setTimeout(() => {
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        try { setOfflineUserId(localStorage.getItem(LAST_USER_KEY)); } catch { /* ignore */ }
+      }
+    }, 4000);
+    return () => window.clearTimeout(t);
+  }, [isLoaded]);
 
   // Local backend (used when signed out or as initial state before query loads)
   const [localData, setLocalData] = useState<LyraData>(readLocalSnapshot);
@@ -208,8 +257,13 @@ export function LyraDataProvider({ children }: { children: ReactNode }) {
   });
 
   // First-run import: when the user signs in and the server snapshot is empty
-  // but their browser has localStorage data, push it up automatically. This
-  // gives existing users a seamless transition into multi-device sync.
+  // but their browser has signed-out data, push it up automatically.
+  //
+  // Setlists left in the shared signed-out storage are only carried over if no
+  // other account has used this device — older versions of the app mirrored a
+  // signed-in user's setlists there, and they must not leak into someone
+  // else's new account. Either way, the shared copy is removed once someone
+  // signs in, because setlists now live only inside an account.
   const importedForUserRef = useRef<string | null>(null);
   useEffect(() => {
     if (!isSignedIn || !userId) return;
@@ -217,19 +271,19 @@ export function LyraDataProvider({ children }: { children: ReactNode }) {
     if (!serverQuery.isSuccess) return;
     const server = serverQuery.data as unknown as LyraData | undefined;
     if (!server) return;
-    if (!isEmptySnapshot(server)) {
-      // Server already has data — no import. Mark done so we don't keep checking.
-      importedForUserRef.current = userId;
-      return;
-    }
-    const local = readLocalSnapshot();
-    if (isEmptySnapshot(local)) {
-      importedForUserRef.current = userId;
-      return;
-    }
     importedForUserRef.current = userId;
-    putMutation.mutate(local, {
+    let lastUser: string | null = null;
+    try { lastUser = localStorage.getItem(LAST_USER_KEY); } catch { /* ignore */ }
+    const local = readLocalSnapshot();
+    const mayTakeSetlists = !lastUser || lastUser === userId;
+    const toImport = mayTakeSetlists ? local : withoutPrivate(local);
+    if (!isEmptySnapshot(server) || isEmptySnapshot(toImport)) {
+      if (!mayTakeSetlists || !isEmptySnapshot(server)) clearAnonymousPrivate();
+      return;
+    }
+    putMutation.mutate(toImport, {
       onSuccess: () => {
+        clearAnonymousPrivate();
         toast({
           title: "Welcome to Lyra",
           description: "Your existing setlists, notes and favourites are now synced to your account.",
@@ -246,6 +300,16 @@ export function LyraDataProvider({ children }: { children: ReactNode }) {
   // unknown — they round-trip as JSON and the in-app TS types are the source
   // of truth.
   const activeData: LyraData = useMemo(() => {
+    if (!isLoaded && offlineUserId) {
+      const cached = readUserCache(offlineUserId);
+      if (cached) return cached;
+    }
+    if (isSignedIn && !serverQuery.data && userId) {
+      // Signed in but the account hasn't loaded yet (slow or no network):
+      // show this account's own on-device copy rather than nothing.
+      const cached = readUserCache(userId);
+      if (cached) return cached;
+    }
     if (isSignedIn && serverQuery.data) {
       // The OpenAPI schema for slices is loose (`unknown`); the in-app TS
       // types are the source of truth. Cast through unknown to bridge.
@@ -258,8 +322,39 @@ export function LyraDataProvider({ children }: { children: ReactNode }) {
         songKeys: (s.songKeys as SongKeyMap) ?? {},
       };
     }
-    return localData;
-  }, [isSignedIn, serverQuery.data, localData]);
+    // Signed out (or not yet known): personal favourites/notes stay on the
+    // device, but setlists are private to an account and never shown.
+    return withoutPrivate(localData);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoaded, offlineUserId, offlineEdits, isSignedIn, userId, serverQuery.data, localData]);
+
+  // Edits made offline (before sign-in could load) are uploaded first, so the
+  // older copy on the server doesn't overwrite them.
+  const uploadedOfflineRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!isSignedIn || !userId || !serverQuery.data) return;
+    if (uploadedOfflineRef.current === userId) return;
+    uploadedOfflineRef.current = userId;
+    let dirty = false;
+    try { dirty = localStorage.getItem(DIRTY_PREFIX + userId) === "1"; } catch { /* ignore */ }
+    const cached = dirty ? readUserCache(userId) : null;
+    if (!cached) return;
+    queryClient.setQueryData(queryKey, cached);
+    putMutation.mutate(cached, {
+      onSuccess: () => {
+        try { localStorage.removeItem(DIRTY_PREFIX + userId); } catch { /* ignore */ }
+      },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSignedIn, userId, serverQuery.data]);
+
+  // Keep this account's on-device copy current (for offline use).
+  useEffect(() => {
+    if (!isSignedIn || !userId || !serverQuery.data) return;
+    let dirty = false;
+    try { dirty = localStorage.getItem(DIRTY_PREFIX + userId) === "1"; } catch { /* ignore */ }
+    if (!dirty) writeUserCache(userId, activeData);
+  }, [isSignedIn, userId, serverQuery.data, activeData]);
 
   // Debounced server PUT so a flurry of edits (e.g. dragging a song multiple
   // positions) collapses into one network round-trip.
@@ -280,18 +375,32 @@ export function LyraDataProvider({ children }: { children: ReactNode }) {
         const prev = (queryClient.getQueryData(queryKey) as unknown as LyraData | undefined) ?? activeData;
         const next = mutator(prev);
         queryClient.setQueryData(queryKey, next);
-        // Also mirror to localStorage so signing out / offline keeps the data.
-        setLocalData(next);
+        // Mirror to this account's own on-device copy (offline use). It is
+        // deliberately NOT written to the shared signed-out storage.
+        if (userId) writeUserCache(userId, next);
         pendingSnapshotRef.current = next;
         if (debounceTimerRef.current !== null) {
           window.clearTimeout(debounceTimerRef.current);
         }
         debounceTimerRef.current = window.setTimeout(flushPending, 600);
+      } else if (!isLoaded && offlineUserId) {
+        // Offline fallback: edit the account's on-device copy and mark it as
+        // changed; it's uploaded to the account when this user is next
+        // signed in online (see the effect below).
+        const cached = readUserCache(offlineUserId) ?? EMPTY_DATA;
+        writeUserCache(offlineUserId, mutator(cached));
+        try { localStorage.setItem(DIRTY_PREFIX + offlineUserId, "1"); } catch { /* ignore */ }
+        setOfflineEdits((n) => n + 1);
       } else {
-        setLocalData(prev => mutator(prev));
+        // Signed out: favourites / notes / keys are kept on the device, but
+        // setlist changes are ignored (the UI asks the user to sign in).
+        setLocalData(prev => {
+          const next = mutator(withoutPrivate(prev));
+          return { ...next, setlists: prev.setlists, setlistOverrides: prev.setlistOverrides };
+        });
       }
     },
-    [isSignedIn, queryClient, queryKey, activeData, flushPending],
+    [isSignedIn, isLoaded, offlineUserId, userId, queryClient, queryKey, activeData, flushPending],
   );
 
   // Flush any pending edits when the page is hidden / unmounted so we don't
@@ -315,8 +424,9 @@ export function LyraDataProvider({ children }: { children: ReactNode }) {
       update,
       isSyncing: putMutation.isPending,
       isReady: isLoaded && (!isSignedIn || serverQuery.isFetched),
+      canUseSetlists: !!isSignedIn || (!isLoaded && !!offlineUserId),
     }),
-    [activeData, update, putMutation.isPending, isLoaded, isSignedIn, serverQuery.isFetched],
+    [activeData, update, putMutation.isPending, isLoaded, isSignedIn, serverQuery.isFetched, offlineUserId],
   );
 
   return <LyraDataContext.Provider value={value}>{children}</LyraDataContext.Provider>;

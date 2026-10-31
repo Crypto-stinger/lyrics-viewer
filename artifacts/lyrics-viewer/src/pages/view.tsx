@@ -17,6 +17,7 @@ import { useAcrSync } from "@/hooks/use-acr-sync";
 import { useTapSync } from "@/hooks/use-tap-sync";
 import { useSongKey, KEY_OPTIONS } from "@/hooks/use-song-key";
 import { useSetlists } from "@/hooks/use-setlists";
+import { useLyraData } from "@/hooks/use-lyra-data";
 import { useSongNotes } from "@/hooks/use-song-notes";
 import { SongNotesEditor } from "@/components/song-notes-editor";
 import { useSetlistOverrides } from "@/hooks/use-setlist-overrides";
@@ -71,6 +72,7 @@ export default function ViewPage() {
   const tapSync = useTapSync(renderedLineCount, tapSyncSongKey);
   const songKey = useSongKey(currentSong?.artist, currentSong?.title);
   const setlistsApi = useSetlists();
+  const { canUseSetlists } = useLyraData();
   const songNotesApi = useSongNotes();
   const songNotes = currentSong ? songNotesApi.getNotes(currentSong.artist, currentSong.title) : null;
   const [notesEditorOpen, setNotesEditorOpen] = useState(false);
@@ -842,7 +844,17 @@ export default function ViewPage() {
                   </button>
                   {addToSetlistOpen && (
                     <div className="border-y border-border/40 bg-muted/30 max-h-64 overflow-y-auto">
-                      {setlistsApi.setlists.length === 0 ? (
+                      {!canUseSetlists ? (
+                        <div className="px-6 py-3 text-sm text-muted-foreground">
+                          Setlists are private to your account.
+                          <button
+                            className="ml-2 text-primary underline"
+                            onClick={() => { setSettingsOpen(false); setLocation("/sign-in"); }}
+                          >
+                            Sign in
+                          </button>
+                        </div>
+                      ) : setlistsApi.setlists.length === 0 ? (
                         <div className="px-6 py-3 text-sm text-muted-foreground">
                           No setlists yet.
                           <button

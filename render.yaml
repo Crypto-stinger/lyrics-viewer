@@ -1,0 +1,55 @@
+# Render Blueprint for Lyra (lyricviewer.com).
+# One web service runs the API and serves the web app; one Postgres database
+# holds signed-in users' setlists, notes and favourites.
+# Setup steps: see MOVE-TO-RENDER.md.
+
+databases:
+  - name: lyra-db
+    plan: basic-256mb
+    region: singapore
+
+services:
+  - type: web
+    name: lyra
+    runtime: node
+    plan: starter
+    region: singapore
+    healthCheckPath: /api/healthz
+    buildCommand: >-
+      npm install -g pnpm@10.28.0 &&
+      pnpm install --frozen-lockfile &&
+      pnpm run typecheck:libs &&
+      pnpm --filter @workspace/lyrics-viewer run build &&
+      pnpm --filter @workspace/api-server run build
+    startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: SERVE_WEB
+        value: "true"
+      - key: BASE_PATH
+        value: /
+      - key: DATABASE_URL
+        fromDatabase:
+          name: lyra-db
+          property: connectionString
+      # ---- From your own Clerk account (dashboard.clerk.com) ----
+      - key: CLERK_SECRET_KEY
+        sync: false
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
+      # Same value as CLERK_PUBLISHABLE_KEY; the web app needs it at build time.
+      - key: VITE_CLERK_PUBLISHABLE_KEY
+        sync: false
+      # ---- Lyrics search ----
+      - key: GENIUS_ACCESS_TOKEN
+        sync: false
+      # ---- Optional: ACR Sync (audio fingerprinting). Leave empty to hide it. ----
+      - key: ACRCLOUD_HOST
+        sync: false
+      - key: ACRCLOUD_ACCESS_KEY
+        sync: false
+      - key: ACRCLOUD_ACCESS_SECRET
+        sync: false
