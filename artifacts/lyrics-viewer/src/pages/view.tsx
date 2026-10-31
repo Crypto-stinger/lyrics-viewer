@@ -742,7 +742,7 @@ export default function ViewPage() {
                         </div>
                         <p className="text-[11px] text-muted-foreground/70 mt-2 leading-snug">
                           {autoCueMode === "follow"
-                            ? "Mic listens to the singer. Best in clean rooms."
+                            ? "Mic listens to the singer and keeps time with the band — holds through gaps, picks up when vocals return. Tap a line to correct it."
                             : autoCueMode === "tap"
                               ? "Tap the button (or press Space) to advance lines. Most reliable live."
                               : "Pick Follow (mic) or Tap (manual) to highlight the current line."}
@@ -922,8 +922,21 @@ export default function ViewPage() {
         <div className="bg-primary/10 border-b border-primary/20 text-primary text-xs px-4 py-2 text-center">
           <div className="flex items-center justify-center gap-2">
             <Crosshair className="w-3 h-3 animate-pulse" />
-            <span>
-              Auto-cue: Follow ({effectiveLang}) — {liveSync.matchedIndex >= 0 ? "following the singer" : "listening for vocals…"}
+            <span data-testid="text-follow-status">
+              Auto-cue: Follow ({effectiveLang}) —{" "}
+              {liveSync.cueState === "listening"
+                ? "listening for vocals…"
+                : liveSync.cueState === "following"
+                  ? "following the singer"
+                  : liveSync.cueState === "coasting"
+                    ? "keeping time with the band"
+                    : liveSync.cueState === "instrumental"
+                      ? "instrumental — waiting for vocals"
+                      : "waiting for the singer"}
+              {liveSync.matchedIndex >= 0 && Math.abs(liveSync.rate - 1) >= 0.03 && (
+                <> · band {liveSync.rate < 1 ? "slower" : "faster"} than record ({Math.round(liveSync.rate * 100)}%)</>
+              )}
+              {liveSync.matchedIndex >= 0 && " · tap a line to correct"}
             </span>
           </div>
           {liveSync.lastHeard && (
@@ -1138,12 +1151,19 @@ export default function ViewPage() {
                 const isCurrent = isMatched || (isScrolling && activeLine === i);
                 // In tap mode, clicking a line jumps the highlight there.
                 // Empty lines remain non-interactive so we don't mis-trigger on stanza gaps.
-                const tapJumpable = tapSync.active && line.trim().length > 0;
+                const tapJumpable = (tapSync.active || liveSync.active) && line.trim().length > 0;
                 return (
                   <span
                     key={i}
                     ref={el => { lineRefs.current[i] = el; }}
-                    onClick={tapJumpable ? () => tapSync.setIndex(i) : undefined}
+                    onClick={tapJumpable ? () => (tapSync.active ? tapSync.setIndex(i) : liveSync.jumpTo(i)) : undefined}
+                    onKeyDown={tapJumpable ? (event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      event.stopPropagation();
+                      if (tapSync.active) tapSync.setIndex(i);
+                      else liveSync.jumpTo(i);
+                    } : undefined}
                     role={tapJumpable ? "button" : undefined}
                     tabIndex={tapJumpable ? 0 : undefined}
                     data-testid={tapJumpable ? `tap-line-${i}` : undefined}

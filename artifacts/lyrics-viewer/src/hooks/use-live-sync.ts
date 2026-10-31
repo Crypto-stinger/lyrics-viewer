@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LrcLine } from "@/lib/lrc";
+import { CueEngine, type CueState } from "@/lib/cue-engine";
 
 interface SpeechRecognitionLike {
   continuous: boolean;
@@ -23,22 +24,14 @@ interface UseLiveSyncResult {
   error: string | null;
   supported: boolean;
   lastHeard: string;
+  /** Band tempo relative to the recording (1 = same, 0.9 = 10% slower). */
+  rate: number;
+  /** What the cue is doing right now, for the status banner. */
+  cueState: CueState;
   start: () => Promise<boolean>;
   stop: () => void;
-}
-
-const STOP_WORDS = new Set([
-  "the","a","an","and","or","but","i","you","we","he","she","it","is","am","are","was","were","be","been","being",
-  "to","of","in","on","at","by","for","with","as","my","your","our","their","this","that","these","those","not",
-  "do","does","did","just","so","too","up","down","yeah","oh","ooh","hey","ah",
-]);
-
-function tokenize(s: string): string[] {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9' ]/g, " ")
-    .split(/\s+/)
-    .filter((t) => t.length >= 3 && !STOP_WORDS.has(t));
+  /** Manually move the cue (e.g. the singer tapped a line). */
+  jumpTo: (index: number) => void;
 }
 
 function getSpeechRecognitionCtor():
@@ -52,25 +45,32 @@ function getSpeechRecognitionCtor():
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 }
 
-// "Follow the singer" sync: every time the speech recogniser hands us a new
-// transcript chunk, find the lyric line whose tokens best overlap the recent
-// transcript window — biased toward staying near the current line so the
-// highlight doesn't ping-pong across the song on weak hits.
+const TICK_MS = 100;
+
+// "Follow the singer" auto-cue.
 //
-// Critically, we do NOT "ride" the LRC timeline after a match: cover bands
-// don't play at the recorded tempo, skip verses, repeat choruses, and stretch
-// outros. Riding the timeline drifts off within seconds. Continuous matching
-// stays glued to whatever the singer actually sings.
+// The speech recogniser feeds words into a CueEngine (lib/cue-engine.ts),
+// which keeps a running position in the song and the band's tempo relative to
+// the record. Between word matches the cue keeps moving at that tempo, waits
+// when the singer stops, and jumps to the next line when they come back in —
+// so it stays in time through loud sections, solos and tempo changes instead
+// of freezing until the next recognised word.
 export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"): UseLiveSyncResult {
   const [active, setActive] = useState(false);
   const [matchedIndex, setMatchedIndex] = useState(-1);
   const [error, setError] = useState<string | null>(null);
   const [lastHeard, setLastHeard] = useState("");
+  const [rate, setRate] = useState(1);
+  const [cueState, setCueState] = useState<CueState>("listening");
   const lastHeardUpdateRef = useRef(0);
 
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const engineRef = useRef<CueEngine | null>(null);
+  const tickTimerRef = useRef<number | null>(null);
   const wantActiveRef = useRef(false);
   const matchedIndexRef = useRef(-1);
+  const rateRef = useRef(1);
+  const cueStateRef = useRef<CueState>("listening");
   const startingRef = useRef(false);
   const sessionIdRef = useRef(0);
   const langRef = useRef(lang);
@@ -78,8 +78,7 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
 
   const restartTimerRef = useRef<number | null>(null);
   const lastStartAtRef = useRef(0);
-  const lrcLinesRef = useRef<LrcLine[] | null>(lrcLines);
-  useEffect(() => { lrcLinesRef.current = lrcLines; }, [lrcLines]);
+  const quickEndsRef = useRef(0);
 
   const supported = useMemo(() => {
     if (getSpeechRecognitionCtor() === null) return false;
@@ -87,97 +86,18 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
     return true;
   }, []);
 
-  const lineTokens = useMemo(() => {
-    if (!lrcLines) return [];
-    return lrcLines.map((l) => tokenize(l.text));
-  }, [lrcLines]);
-
-  const matchTranscript = useCallback(
-    (transcript: string) => {
-      const now = performance.now();
-      if (now - lastHeardUpdateRef.current > 250) {
-        lastHeardUpdateRef.current = now;
-        setLastHeard(transcript.trim().slice(-80));
-      }
-
-      const tokens = tokenize(transcript);
-      if (tokens.length === 0) return;
-      // Recent window — last ~12 meaningful tokens so we react to the current phrase
-      const recent = tokens.slice(-12);
-      const recentSet = new Set(recent);
-
-      const cur = matchedIndexRef.current;
-
-      // Score every line. Bias strongly toward lines near the current one.
-      // Far-away jumps require a much stronger match — this stops "love" or "baby"
-      // (which appear in 30% of songs) from teleporting the cursor across the page.
-      let bestScore = 0;
-      let bestIdx = -1;
-      let bestDistinctHits = 0;
-      for (let i = 0; i < lineTokens.length; i++) {
-        const lt = lineTokens[i];
-        if (lt.length === 0) continue;
-        // Count distinct token hits (de-dupe so "baby baby baby" only counts once)
-        const ltSet = new Set(lt);
-        let distinctHits = 0;
-        for (const t of ltSet) if (recentSet.has(t)) distinctHits++;
-        if (distinctHits === 0) continue;
-        const lineCoverage = distinctHits / Math.max(ltSet.size, 1);
-        const transcriptCoverage = distinctHits / Math.max(recent.length, 1);
-        const overlap = 0.7 * lineCoverage + 0.3 * transcriptCoverage;
-
-        // Proximity bonus / penalty:
-        //  - Same / next 1-2 lines: full score (advancing naturally)
-        //  - Within ±8 lines: small penalty
-        //  - Far away: heavy penalty (must be a very strong, multi-word match to win)
-        let proximityFactor = 1;
-        if (cur >= 0) {
-          const distance = Math.abs(i - cur);
-          if (distance <= 2) proximityFactor = 1.0;
-          else if (distance <= 8) proximityFactor = 0.85;
-          else proximityFactor = 0.45;
-        }
-
-        const adjusted = overlap * proximityFactor;
-        if (adjusted > bestScore) {
-          bestScore = adjusted;
-          bestIdx = i;
-          bestDistinctHits = distinctHits;
-        }
-      }
-
-      if (bestIdx < 0) return;
-
-      // Acceptance gates:
-      //  - First lock (no current line yet): need a clearly strong hit AND >=2 distinct
-      //    tokens so we don't snap to a random line on the first stray word.
-      //  - Tracking near current line: looser, single-word hits OK so the cursor keeps
-      //    moving with the singer through short connector lines.
-      //  - Far jumps (>8 lines from current): require BOTH a strong score AND >=2 distinct
-      //    tokens. A single repeated common word is never enough to teleport across the page.
-      const distance = cur >= 0 ? Math.abs(bestIdx - cur) : 0;
-      const isFarJump = cur >= 0 && distance > 8;
-      const isFirstLock = cur < 0;
-
-      let accept: boolean;
-      if (isFirstLock) {
-        accept = bestScore >= 0.45 && bestDistinctHits >= 2;
-      } else if (isFarJump) {
-        accept = bestScore >= 0.40 && bestDistinctHits >= 2;
-      } else {
-        accept = bestScore >= 0.25;
-      }
-
-      if (accept && bestIdx !== cur) {
-        matchedIndexRef.current = bestIdx;
-        setMatchedIndex(bestIdx);
-      }
-    },
-    [lineTokens],
-  );
-
-  const matchTranscriptRef = useRef(matchTranscript);
-  useEffect(() => { matchTranscriptRef.current = matchTranscript; }, [matchTranscript]);
+  const publish = useCallback(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+    const snap = eng.tick(performance.now());
+    if (snap.index !== matchedIndexRef.current) {
+      matchedIndexRef.current = snap.index;
+      setMatchedIndex(snap.index);
+    }
+    const r = Math.round(snap.rate * 100) / 100;
+    if (r !== rateRef.current) { rateRef.current = r; setRate(r); }
+    if (snap.state !== cueStateRef.current) { cueStateRef.current = snap.state; setCueState(snap.state); }
+  }, []);
 
   const stop = useCallback(() => {
     sessionIdRef.current += 1;
@@ -187,6 +107,10 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
       clearTimeout(restartTimerRef.current);
       restartTimerRef.current = null;
     }
+    if (tickTimerRef.current) {
+      clearInterval(tickTimerRef.current);
+      tickTimerRef.current = null;
+    }
     if (recognitionRef.current) {
       recognitionRef.current.onend = null;
       recognitionRef.current.onerror = null;
@@ -194,11 +118,23 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
       try { recognitionRef.current.stop(); } catch { /* ignore */ }
       recognitionRef.current = null;
     }
+    engineRef.current = null;
     setActive(false);
     setMatchedIndex(-1);
     setLastHeard("");
+    setRate(1);
+    setCueState("listening");
     matchedIndexRef.current = -1;
+    rateRef.current = 1;
+    cueStateRef.current = "listening";
   }, []);
+
+  const jumpTo = useCallback((index: number) => {
+    const eng = engineRef.current;
+    if (!eng) return;
+    eng.jumpTo(index, performance.now());
+    publish();
+  }, [publish]);
 
   const start = useCallback(async (): Promise<boolean> => {
     if (startingRef.current || recognitionRef.current) return active;
@@ -221,17 +157,28 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
     }
 
     try {
+      const engine = new CueEngine(lrcLines);
+      engineRef.current = engine;
       const r = new SR();
       r.continuous = true;
       r.interimResults = true;
       r.lang = langRef.current;
       r.onresult = (e) => {
         if (isStale()) return;
+        // The last few result segments = the most recent phrase. Older,
+        // already-final segments aren't needed: the engine only looks at the
+        // last ~9 words.
         let transcript = "";
-        for (let i = e.resultIndex; i < e.results.length; i++) {
+        for (let i = Math.max(0, e.results.length - 3); i < e.results.length; i++) {
           transcript += e.results[i][0].transcript + " ";
         }
-        matchTranscriptRef.current(transcript);
+        const now = performance.now();
+        engine.hear(transcript, now);
+        if (now - lastHeardUpdateRef.current > 250) {
+          lastHeardUpdateRef.current = now;
+          setLastHeard(transcript.trim().slice(-80));
+        }
+        publish();
       };
       r.onerror = (e) => {
         if (isStale()) return;
@@ -246,9 +193,14 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
       };
       r.onend = () => {
         if (isStale() || !wantActiveRef.current || recognitionRef.current !== r) return;
-        const RESTART_DELAY_MS = 2500;
-        const elapsed = Date.now() - lastStartAtRef.current;
-        const wait = Math.max(0, RESTART_DELAY_MS - elapsed);
+        // While the recogniser restarts it hears nothing — tell the engine so
+        // that silence isn't read as "the singer stopped".
+        engine.setDeaf(true, performance.now());
+        // Restart fast (the old 2.5 s pause lost whole lines). Back off only
+        // if the browser keeps ending sessions immediately.
+        const ranFor = Date.now() - lastStartAtRef.current;
+        quickEndsRef.current = ranFor < 1500 ? quickEndsRef.current + 1 : 0;
+        const wait = quickEndsRef.current >= 3 ? 2000 : 150;
         if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
         restartTimerRef.current = window.setTimeout(() => {
           restartTimerRef.current = null;
@@ -256,10 +208,9 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
           try {
             lastStartAtRef.current = Date.now();
             r.start();
+            engine.setDeaf(false, performance.now());
           } catch {
-            recognitionRef.current = null;
-            wantActiveRef.current = false;
-            setActive(false);
+            stop();
             setError("Live sync stopped unexpectedly. Tap Live Sync to restart.");
           }
         }, wait);
@@ -275,6 +226,8 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
 
       recognitionRef.current = r;
       wantActiveRef.current = true;
+      if (tickTimerRef.current) clearInterval(tickTimerRef.current);
+      tickTimerRef.current = window.setInterval(publish, TICK_MS);
       setActive(true);
       startingRef.current = false;
       return true;
@@ -283,7 +236,7 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
       if (!isStale()) setError("Could not start speech recognition. Please try again.");
       return false;
     }
-  }, [lrcLines, stop, active]);
+  }, [lrcLines, stop, active, publish]);
 
   useEffect(() => () => stop(), [stop]);
 
@@ -305,5 +258,5 @@ export function useLiveSync(lrcLines: LrcLine[] | null, lang: string = "en-US"):
     }
   }, [lang, stop]);
 
-  return { active, matchedIndex, error, supported, lastHeard, start, stop };
+  return { active, matchedIndex, error, supported, lastHeard, rate, cueState, start, stop, jumpTo };
 }

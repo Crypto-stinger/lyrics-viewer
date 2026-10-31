@@ -1,13 +1,15 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { logger } from "../lib/logger";
+import { identifyFromLyrics, type FetchedLyrics, type SearchHit } from "../lib/lyric-rank";
 
 const router = Router();
 
-// Simple per-IP rate limiter: 30 requests / 5 min. Higher than the audio
-// fingerprint endpoint because typing snippets is cheap and users may try
-// several lines before getting a confident match.
+// Simple per-IP rate limiter: 60 requests / 5 min. Live Cover ID now searches
+// progressively while listening (after ~5 words, then again as more arrive,
+// at most 4 times per listen), so one identification can use several requests.
+// Repeat lookups are served from the caches below.
 const RATE_WINDOW_MS = 5 * 60 * 1000;
-const RATE_MAX = 30;
+const RATE_MAX = 60;
 const rateBuckets = new Map<string, number[]>();
 
 function rateLimit(req: Request, res: Response, next: NextFunction): void {
@@ -39,21 +41,15 @@ interface GeniusSearchResponse {
         title?: string;
         primary_artist?: { name?: string };
         full_title?: string;
+        stats?: { pageviews?: number };
       };
     }>;
   };
 }
 
-interface LrcLibGetResponse {
+interface LrcLibRecord {
   syncedLyrics?: string | null;
   plainLyrics?: string | null;
-}
-
-interface Candidate {
-  title: string;
-  artist: string;
-  hasSynced: boolean;
-  hasPlain: boolean;
 }
 
 /** Strip noisy parenthetical/bracketed suffixes Genius often appends to track
@@ -67,17 +63,54 @@ function cleanTitle(t: string): string {
     .trim();
 }
 
-async function searchGenius(query: string, token: string): Promise<Array<{ title: string; artist: string }>> {
+async function fetchWithTimeout(url: string, init: RequestInit = {}, ms = 4500): Promise<globalThis.Response> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ---- Small TTL caches -------------------------------------------------------
+// Live Cover ID searches progressively as more words arrive (5 words, then 8,
+// then 11…), so the same candidates come up again seconds later. Caching keeps
+// follow-up searches fast and stays polite to Genius / LRCLIB.
+class TtlCache<V> {
+  private map = new Map<string, { v: V; at: number }>();
+  constructor(private max: number, private ttlMs: number) {}
+  get(k: string): V | undefined {
+    const e = this.map.get(k);
+    if (!e) return undefined;
+    if (Date.now() - e.at > this.ttlMs) { this.map.delete(k); return undefined; }
+    this.map.delete(k);
+    this.map.set(k, e); // refresh LRU position
+    return e.v;
+  }
+  set(k: string, v: V): void {
+    this.map.set(k, { v, at: Date.now() });
+    if (this.map.size > this.max) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) this.map.delete(oldest);
+    }
+  }
+}
+const searchCache = new TtlCache<SearchHit[]>(1000, 6 * 60 * 60 * 1000);
+const lyricsCache = new TtlCache<FetchedLyrics>(3000, 24 * 60 * 60 * 1000);
+
+async function searchGenius(query: string, token: string): Promise<SearchHit[]> {
+  const ck = query.toLowerCase();
+  const cached = searchCache.get(ck);
+  if (cached) return cached;
   const url = `https://api.genius.com/search?q=${encodeURIComponent(query)}`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const res = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) {
     throw new Error(`Genius search HTTP ${res.status}`);
   }
   const data = (await res.json()) as GeniusSearchResponse;
   const hits = data.response?.hits ?? [];
-  const out: Array<{ title: string; artist: string }> = [];
+  const out: SearchHit[] = [];
   const seen = new Set<string>();
   for (const h of hits) {
     if (h.type && h.type !== "song") continue;
@@ -87,26 +120,99 @@ async function searchGenius(query: string, token: string): Promise<Array<{ title
     const key = `${artist.toLowerCase()}|${title.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ title, artist });
+    const pageviews = h.result?.stats?.pageviews;
+    out.push({ title, artist, ...(typeof pageviews === "number" ? { pageviews } : {}) });
     if (out.length >= 10) break;
   }
+  searchCache.set(ck, out);
   return out;
 }
 
-async function checkLrclib(artist: string, title: string): Promise<{ hasSynced: boolean; hasPlain: boolean }> {
-  const cleaned = cleanTitle(title);
-  const url = `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(cleaned)}`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return { hasSynced: false, hasPlain: false };
-    const data = (await res.json()) as LrcLibGetResponse;
-    return {
-      hasSynced: typeof data.syncedLyrics === "string" && data.syncedLyrics.trim().length > 0,
-      hasPlain: typeof data.plainLyrics === "string" && data.plainLyrics.trim().length > 0,
-    };
-  } catch {
-    return { hasSynced: false, hasPlain: false };
+// LRCLIB is a free service and rate-limits bursts (HTTP 429). Space our
+// requests out server-wide instead of firing a candidate list all at once.
+const LRCLIB_MIN_GAP_MS = 120;
+let lrclibNextSlot = 0;
+async function lrclibFetch(url: string): Promise<globalThis.Response> {
+  const now = Date.now();
+  const slot = Math.max(now, lrclibNextSlot);
+  lrclibNextSlot = slot + LRCLIB_MIN_GAP_MS;
+  if (slot > now) await new Promise((r) => setTimeout(r, slot - now));
+  let res = await fetchWithTimeout(url);
+  if (res.status === 429) {
+    await new Promise((r) => setTimeout(r, 600));
+    res = await fetchWithTimeout(url);
   }
+  return res;
+}
+
+/** Full lyrics for one candidate, used to verify the heard snippet is really
+ *  in the song (and to find which line). Exact LRCLIB lookup first, then a
+ *  fuzzy LRCLIB search on artist + title, then lyrics.ovh. */
+async function fetchLyricsForCheck(artist: string, title: string): Promise<FetchedLyrics> {
+  const ck = `${artist.toLowerCase()}|${title.toLowerCase()}`;
+  const cached = lyricsCache.get(ck);
+  if (cached) return cached;
+  const cleaned = cleanTitle(title);
+  const none: FetchedLyrics = { text: null, hasSynced: false, hasPlain: false };
+  const toResult = (d: LrcLibRecord | null | undefined): FetchedLyrics | null => {
+    if (!d) return null;
+    const synced = typeof d.syncedLyrics === "string" && d.syncedLyrics.trim().length > 0;
+    const plain = typeof d.plainLyrics === "string" && d.plainLyrics.trim().length > 0;
+    if (!synced && !plain) return null;
+    return { text: (plain ? d.plainLyrics : d.syncedLyrics) ?? null, hasSynced: synced, hasPlain: plain };
+  };
+  let result: FetchedLyrics | null = null;
+  let transientFailure = false;
+  const transient = (status: number) => status === 429 || status >= 500;
+  try {
+    const res = await lrclibFetch(
+      `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(cleaned)}`,
+    );
+    if (res.ok) result = toResult((await res.json()) as LrcLibRecord);
+    else if (transient(res.status)) transientFailure = true;
+  } catch {
+    transientFailure = true;
+  }
+  if (!result && !transientFailure) {
+    try {
+      const res = await lrclibFetch(
+        `https://lrclib.net/api/search?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(cleaned)}`,
+      );
+      if (res.ok) {
+        const arr = (await res.json()) as LrcLibRecord[];
+        if (Array.isArray(arr)) {
+          for (const r of arr) {
+            result = toResult(r);
+            if (result) break;
+          }
+        }
+      } else if (transient(res.status)) transientFailure = true;
+    } catch {
+      transientFailure = true;
+    }
+  }
+  if (!result) {
+    // Second source, so a busy LRCLIB doesn't leave candidates unverified.
+    try {
+      const res = await fetchWithTimeout(
+        `https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(cleaned)}`,
+        {},
+        4000,
+      );
+      if (res.ok) {
+        const d = (await res.json()) as { lyrics?: string };
+        if (typeof d.lyrics === "string" && d.lyrics.trim()) {
+          result = { text: d.lyrics, hasSynced: false, hasPlain: true };
+        }
+      }
+    } catch {
+      /* ignore — lyrics.ovh is best-effort */
+    }
+  }
+  const final = result ?? none;
+  // Don't remember "no lyrics" if LRCLIB was just busy or down.
+  if (result || !transientFailure) lyricsCache.set(ck, final);
+  return final;
 }
 
 router.post("/lyric-search", rateLimit, async (req, res) => {
@@ -130,41 +236,48 @@ router.post("/lyric-search", rateLimit, async (req, res) => {
   // Log length only — the raw query is user-spoken lyrics and may be sensitive.
   log.info({ queryLen: query.length }, "Lyric search received");
 
-  let geniusHits: Array<{ title: string; artist: string }> = [];
+  let searchFailures = 0;
+  let searchCalls = 0;
   try {
-    geniusHits = await searchGenius(query, token);
+    const result = await identifyFromLyrics(query, {
+      search: async (q) => {
+        searchCalls += 1;
+        try {
+          return await searchGenius(q, token);
+        } catch (err) {
+          searchFailures += 1;
+          throw err;
+        }
+      },
+      lyrics: fetchLyricsForCheck,
+    });
+
+    if (searchCalls > 0 && searchFailures === searchCalls) {
+      log.error("All Genius searches failed");
+      return res.status(502).json({ success: false, message: "Lyric search is unavailable right now. Try again in a moment." });
+    }
+
+    log.info(
+      {
+        total: result.results.length,
+        confidence: result.confidence.level,
+        score: Number(result.confidence.score.toFixed(2)),
+        margin: Number(result.confidence.margin.toFixed(2)),
+        queries: result.queries.length,
+      },
+      "Lyric search results returned",
+    );
+
+    return res.json({
+      success: true,
+      results: result.results,
+      confidence: result.confidence,
+      heard: result.heard,
+    });
   } catch (err) {
-    log.error({ err }, "Genius search failed");
+    log.error({ err }, "Lyric search failed");
     return res.status(502).json({ success: false, message: "Lyric search is unavailable right now. Try again in a moment." });
   }
-
-  if (geniusHits.length === 0) {
-    log.info("Genius returned no hits");
-    return res.json({ success: true, results: [] });
-  }
-
-  // Enrich each candidate with LRCLIB availability so the UI can show a
-  // "synced" / "plain" badge. We intentionally DO NOT resort by availability:
-  // Genius's relevance ranking (which is full-text over lyric bodies) is the
-  // strongest signal that this song actually contains the snippet the user
-  // sang. LRCLIB availability is a UI hint, not a ranking criterion.
-  const enriched: Candidate[] = await Promise.all(
-    geniusHits.map(async (h): Promise<Candidate> => {
-      const { hasSynced, hasPlain } = await checkLrclib(h.artist, h.title);
-      return { ...h, hasSynced, hasPlain };
-    }),
-  );
-
-  log.info(
-    {
-      total: enriched.length,
-      synced: enriched.filter((c) => c.hasSynced).length,
-      plain: enriched.filter((c) => !c.hasSynced && c.hasPlain).length,
-    },
-    "Lyric search results returned",
-  );
-
-  return res.json({ success: true, results: enriched });
 });
 
 export default router;

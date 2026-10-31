@@ -1,16 +1,22 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Mic, X, Loader2, AlertCircle, Search, RotateCcw, Type } from "lucide-react";
+import { Mic, X, Loader2, AlertCircle, Search, RotateCcw, Type, ListMusic } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { heardTokens, judgeConfidence, type Confidence } from "@/lib/lyric-match";
+import { useLibraryMatcher, type LibraryHit } from "@/hooks/use-library-matcher";
 
 interface Props {
   onClose: () => void;
   onOpenLyrics: (artist: string, title: string) => void;
 }
 
-// Tunables. 10 seconds is long enough for Web Speech to capture a clean lyric
-// line and short enough that a singer on stage isn't staring at a spinner.
-const LISTEN_SECONDS = 10;
+// Tunables. We listen for up to 20 s but search as soon as ~5 words are in,
+// and stop the moment one song is a clear winner — usually well before the
+// timer runs out.
+const LISTEN_SECONDS = 20;
+const FIRST_SEARCH_WORDS = 5;
+const MORE_WORDS_BEFORE_RESEARCH = 3;
+const MAX_SEARCHES_PER_LISTEN = 5;
 const LYRIC_SEARCH_ENDPOINT = `${import.meta.env.BASE_URL}api/lyric-search`;
 const LRCLIB_SEARCH = (q: string) => `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`;
 
@@ -49,11 +55,36 @@ interface LyricCandidate {
   title: string;
   hasSynced?: boolean;
   hasPlain?: boolean;
+  /** 0..1 — how well the heard words line up with this song's lyrics. */
+  matchScore?: number | null;
+  matchedLine?: string;
+  alsoBy?: string[];
+  /** Found in the band's own setlists / favourites. */
+  fromLibrary?: boolean;
 }
 interface LyricSearchResponse {
   success: boolean;
-  results?: Array<{ artist: string; title: string; hasSynced?: boolean; hasPlain?: boolean }>;
+  results?: LyricCandidate[];
+  confidence?: Confidence;
   message?: string;
+}
+interface SearchOutcome {
+  results: LyricCandidate[];
+  confidence: Confidence | null;
+}
+
+const NO_CONFIDENCE: Confidence = { level: "none", score: 0, margin: 0, words: 0 };
+
+/** Put library (setlist/favourite) hits first when they match well, and drop
+ *  duplicates of the same song coming back from the web search. */
+function mergeWithLibrary(lib: LibraryHit[], web: LyricCandidate[]): LyricCandidate[] {
+  const good = lib.filter((h) => h.matchScore >= 0.6);
+  const key = (a: string, t: string) => `${a.toLowerCase()}|${t.toLowerCase()}`;
+  const seen = new Set(good.map((h) => key(h.artist, h.title)));
+  return [
+    ...good.map((h) => ({ ...h, fromLibrary: true, hasSynced: undefined, hasPlain: undefined })),
+    ...web.filter((w) => !seen.has(key(w.artist, w.title))),
+  ];
 }
 
 // ---- Helpers -----------------------------------------------------------------
@@ -113,11 +144,11 @@ async function searchLrclib(query: string): Promise<LyricCandidate[]> {
   return out;
 }
 
-/** Server-side Genius search (full-text over lyric bodies), enriched with
- *  LRCLIB availability flags so the UI can prefer songs we can actually
- *  display synced lyrics for. Falls back to client-side LRCLIB search if the
- *  server endpoint fails. */
-async function searchByLyricSnippet(query: string): Promise<LyricCandidate[]> {
+/** Server-side search: Genius full-text search, then each candidate's lyrics
+ *  are fetched and fuzzy-aligned with what was heard, so the ranking and the
+ *  confidence reflect whether the words are really in the song. Falls back to
+ *  client-side LRCLIB title search if the server endpoint fails. */
+async function searchByLyricSnippet(query: string): Promise<SearchOutcome> {
   try {
     const res = await fetch(LYRIC_SEARCH_ENDPOINT, {
       method: "POST",
@@ -127,20 +158,20 @@ async function searchByLyricSnippet(query: string): Promise<LyricCandidate[]> {
     // 400 = the server explicitly rejected the query (too short, etc.). We
     // surface zero results so the snippet UI can show its own "type a longer
     // line" message rather than papering over it with LRCLIB title-only hits.
-    if (res.status === 400) return [];
+    if (res.status === 400) return { results: [], confidence: null };
     if (!res.ok) {
       // 503 / 429 / 502 — service degraded. Give the user *something* by
-      // falling back to LRCLIB's title-only search.
-      return await searchLrclib(query);
+      // falling back to LRCLIB's title-only search (never auto-opened).
+      return { results: await searchLrclib(query), confidence: null };
     }
     const data = (await res.json()) as LyricSearchResponse;
     if (data.success && Array.isArray(data.results) && data.results.length > 0) {
-      return data.results;
+      return { results: data.results, confidence: data.confidence ?? null };
     }
     // Server reachable but no hits — try LRCLIB as a cross-check.
-    return await searchLrclib(query);
+    return { results: await searchLrclib(query), confidence: null };
   } catch {
-    return await searchLrclib(query);
+    return { results: await searchLrclib(query), confidence: null };
   }
 }
 
@@ -149,6 +180,10 @@ type Mode = "idle" | "listening" | "processing" | "results" | "error";
 
 export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
   const [mode, setMode] = useState<Mode>("idle");
+  const library = useLibraryMatcher(true);
+  // Best match so far; confidence is advisory, never permission to navigate.
+  const [bestGuess, setBestGuess] = useState<{ cand: LyricCandidate; conf: Confidence } | null>(null);
+  const [searching, setSearching] = useState(false);
   const [countdown, setCountdown] = useState(LISTEN_SECONDS);
   const [errorMsg, setErrorMsg] = useState("");
   const [liveTranscript, setLiveTranscript] = useState("");
@@ -178,6 +213,14 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
   // from a previous session can never overwrite a fresh one.
   const sessionIdRef = useRef(0);
   const mountedRef = useRef(true);
+  // Progressive search bookkeeping (per listen).
+  const searchInFlightRef = useRef(false);
+  const searchedWordsRef = useRef(0);
+  const searchesRef = useRef(0);
+  const lockedRef = useRef(false);
+  const latestResultsRef = useRef<SearchOutcome>({ results: [], confidence: null });
+  const libraryRef = useRef(library);
+  libraryRef.current = library;
 
   // ---- Cleanup ---------------------------------------------------------------
   const stopMicAndTimer = useCallback(() => {
@@ -204,6 +247,69 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
     };
   }, [onClose, stopMicAndTimer]);
 
+  // A confident match ends listening, but always leaves selection to the user.
+  const lockIn = useCallback((cand: LyricCandidate, conf: Confidence, candidates: LyricCandidate[]) => {
+    if (lockedRef.current || conf.level !== "high") return;
+    lockedRef.current = true;
+    userStoppedRef.current = true;
+    stopMicAndTimer();
+    setBestGuess({ cand, conf });
+    setLyricCandidates(candidates.length ? candidates : [cand]);
+    setSearching(false);
+    setMode("results");
+  }, [stopMicAndTimer]);
+
+  /** Check the band's own songs first: instant, offline, and 5 words are
+   *  usually decisive among a few dozen songs. */
+  const checkLibrary = useCallback((heard: string[]): LibraryHit[] => {
+    if (heard.length < 4) return [];
+    const hits = libraryRef.current.match(heard);
+    if (hits.length && !lockedRef.current) {
+      const conf = judgeConfidence(hits[0].matchScore, hits[1]?.matchScore ?? 0, heard);
+      // A small library makes big margins easy, so ask for a stronger match.
+      if (conf.level === "high" && hits[0].matchScore >= 0.82) {
+        lockIn({ ...hits[0], fromLibrary: true }, conf, mergeWithLibrary(hits, latestResultsRef.current.results));
+      }
+    }
+    return hits;
+  }, [lockIn]);
+
+  /** While listening: search once ~5 words are in, then again every few new
+   *  words, and lock in as soon as one song is clearly ahead. */
+  const maybeSearch = useCallback((text: string) => {
+    if (lockedRef.current) return;
+    const heard = heardTokens(text);
+    const libHits = checkLibrary(heard);
+    if (lockedRef.current) return;
+    if (heard.length < FIRST_SEARCH_WORDS) return;
+    if (searchInFlightRef.current || searchesRef.current >= MAX_SEARCHES_PER_LISTEN) return;
+    if (searchesRef.current > 0 && heard.length - searchedWordsRef.current < MORE_WORDS_BEFORE_RESEARCH) return;
+    searchInFlightRef.current = true;
+    searchesRef.current += 1;
+    searchedWordsRef.current = heard.length;
+    const session = sessionIdRef.current;
+    setSearching(true);
+    void searchByLyricSnippet(heard.join(" "))
+      .then((out) => {
+        if (!mountedRef.current || sessionIdRef.current !== session || lockedRef.current) return;
+        const merged = mergeWithLibrary(libHits, out.results);
+        latestResultsRef.current = { results: merged, confidence: out.confidence };
+        const top = merged[0];
+        if (!top) return;
+        const conf = top.fromLibrary
+          ? judgeConfidence(top.matchScore ?? 0, merged[1]?.matchScore ?? 0, heard)
+          : out.confidence ?? NO_CONFIDENCE;
+        setBestGuess({ cand: top, conf });
+        if (conf.level === "high" && (top.matchScore ?? 0) > 0) lockIn(top, conf, merged);
+      })
+      .finally(() => {
+        if (mountedRef.current && sessionIdRef.current === session) {
+          searchInFlightRef.current = false;
+          setSearching(false);
+        }
+      });
+  }, [checkLibrary, lockIn]);
+
   // ---- Typed-snippet path (primary, always works) ---------------------------
   const handleSnippetSearch = useCallback(async (queryArg?: string) => {
     const query = (queryArg ?? snippetText).trim();
@@ -217,11 +323,19 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
     setSnippetError("");
     setLyricCandidates([]);
     try {
-      const hits = await searchByLyricSnippet(query);
+      const heard = heardTokens(query);
+      const libHits = heard.length >= 3 ? libraryRef.current.match(heard) : [];
+      const out = await searchByLyricSnippet(query);
       if (!alive()) return;
+      const hits = mergeWithLibrary(libHits, out.results);
       if (hits.length === 0) {
         setSnippetError("No songs found for that phrase. Try a longer or more distinctive line.");
       } else {
+        const top = hits[0];
+        const conf = top.fromLibrary
+          ? judgeConfidence(top.matchScore ?? 0, hits[1]?.matchScore ?? 0, heard)
+          : out.confidence ?? NO_CONFIDENCE;
+        setBestGuess({ cand: top, conf });
         setLyricCandidates(hits);
         setMode("results");
       }
@@ -239,6 +353,7 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
     const session = sessionIdRef.current;
     const alive = () => mountedRef.current && sessionIdRef.current === session;
 
+    if (lockedRef.current) return;
     setMode("processing");
     stopMicAndTimer();
 
@@ -253,14 +368,29 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
       return;
     }
 
+    const heard = heardTokens(transcript);
+    // Already searched with (nearly) all of these words while listening.
+    if (latestResultsRef.current.results.length > 0 && heard.length - searchedWordsRef.current < 2) {
+      setLyricCandidates(latestResultsRef.current.results);
+      setMode("results");
+      return;
+    }
     try {
-      const hits = await searchByLyricSnippet(transcript);
-      if (!alive()) return;
+      const libHits = libraryRef.current.match(heard);
+      const out = await searchByLyricSnippet(heard.join(" "));
+      if (!alive() || lockedRef.current) return;
+      const hits = mergeWithLibrary(libHits, out.results);
+      if (hits[0]) {
+        const conf = hits[0].fromLibrary
+          ? judgeConfidence(hits[0].matchScore ?? 0, hits[1]?.matchScore ?? 0, heard)
+          : out.confidence ?? NO_CONFIDENCE;
+        setBestGuess({ cand: hits[0], conf });
+      }
       setLyricCandidates(hits);
     } catch {
       /* swallow — surfaced via no-results state */
     } finally {
-      if (alive()) setMode("results");
+      if (alive() && !lockedRef.current) setMode("results");
     }
   }, [stopMicAndTimer]);
 
@@ -287,7 +417,9 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
         transcriptRef.current = (transcriptRef.current + " " + appendedFinal).trim();
         setSpeechIssue("");
       }
-      setLiveTranscript(dedupeTranscript((transcriptRef.current + " " + interim).trim()));
+      const soFar = (transcriptRef.current + " " + interim).trim();
+      setLiveTranscript(dedupeTranscript(soFar));
+      maybeSearch(soFar);
     };
     r.onerror = (ev) => {
       // eslint-disable-next-line no-console
@@ -318,7 +450,7 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
       }
     };
     return r;
-  }, []);
+  }, [maybeSearch]);
 
   const startListening = useCallback(() => {
     // New session — invalidates any in-flight finalisers from a prior listen.
@@ -331,6 +463,13 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
     countdownRef.current = LISTEN_SECONDS;
     setCountdown(LISTEN_SECONDS);
     userStoppedRef.current = false;
+    lockedRef.current = false;
+    searchInFlightRef.current = false;
+    searchedWordsRef.current = 0;
+    searchesRef.current = 0;
+    latestResultsRef.current = { results: [], confidence: null };
+    setBestGuess(null);
+    setSearching(false);
 
     if (typeof window !== "undefined" && !window.isSecureContext) {
       setErrorMsg("Listening requires HTTPS. Open the site over a secure connection.");
@@ -388,6 +527,9 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
   const reset = () => {
     sessionIdRef.current += 1;
     stopMicAndTimer();
+    lockedRef.current = false;
+    setBestGuess(null);
+    setSearching(false);
     userStoppedRef.current = false;
     setMode("idle");
     setErrorMsg("");
@@ -437,10 +579,10 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
                 data-testid="button-start-listening"
               >
                 <Mic className="w-5 h-5 mr-2" />
-                Listen for {LISTEN_SECONDS}s
+                Listen
               </Button>
               <p className="text-[11px] text-muted-foreground/70 text-center -mt-2 px-2">
-                We'll transcribe the vocals and search the lyrics — works best on the chorus.
+                About 5 clear words is usually enough — we check your setlists first and stop as soon as we're sure.
               </p>
 
               <div className="flex items-center gap-3">
@@ -507,6 +649,25 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
                   {speechIssue}
                 </p>
               )}
+              <div className="min-h-[2.75rem] px-3 py-2 rounded-lg border border-dashed border-border text-xs" data-testid="text-best-guess">
+                {bestGuess ? (
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-muted-foreground">Best guess so far</p>
+                      <p className="text-foreground font-medium truncate">{bestGuess.cand.title} — {bestGuess.cand.artist}</p>
+                    </div>
+                    <ConfidenceBadge level={bestGuess.conf.level} />
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground flex items-center gap-2">
+                    {searching && <Loader2 className="w-3 h-3 animate-spin" />}
+                    {heardTokens(liveTranscript).length < FIRST_SEARCH_WORDS
+                      ? `Need about ${FIRST_SEARCH_WORDS} words to start matching…`
+                      : "Checking…"}
+                    {library.total > 0 && ` · checking your ${library.total} saved songs first`}
+                  </p>
+                )}
+              </div>
               <Button variant="outline" className="w-full" onClick={stopListening} data-testid="button-stop-listening">
                 Stop &amp; Identify Now
               </Button>
@@ -543,9 +704,22 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
                       >
                         <div className="min-w-0 flex-1">
                           <p className="text-sm font-medium text-foreground leading-snug truncate">{s.title}</p>
-                          <p className="text-xs text-muted-foreground truncate">{s.artist}</p>
+                          <p className="text-xs text-muted-foreground truncate">
+                            {s.artist}
+                            {s.alsoBy && s.alsoBy.length > 0 && <span className="text-muted-foreground/60"> · also {s.alsoBy.slice(0, 2).join(", ")}</span>}
+                          </p>
+                          {s.matchedLine && (
+                            <p className="text-[11px] text-muted-foreground/80 italic truncate">"{s.matchedLine}"</p>
+                          )}
                         </div>
-                        {s.hasSynced ? (
+                        {i === 0 && bestGuess && bestGuess.cand.title === s.title && bestGuess.cand.artist === s.artist && (
+                          <ConfidenceBadge level={bestGuess.conf.level} />
+                        )}
+                        {s.fromLibrary ? (
+                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-primary/15 text-primary border border-primary/30 flex items-center gap-1">
+                            <ListMusic className="w-3 h-3" /> yours
+                          </span>
+                        ) : s.hasSynced ? (
                           <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-primary/15 text-primary border border-primary/30">
                             synced
                           </span>
@@ -628,5 +802,20 @@ export function CoverIdModal({ onClose, onOpenLyrics }: Props) {
         </div>
       </div>
     </div>
+  );
+}
+
+function ConfidenceBadge({ level }: { level: Confidence["level"] }) {
+  const map: Record<Confidence["level"], { label: string; cls: string }> = {
+    high: { label: "sure", cls: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30" },
+    medium: { label: "likely", cls: "bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30" },
+    low: { label: "unsure", cls: "bg-muted text-muted-foreground border-border" },
+    none: { label: "no match", cls: "bg-muted text-muted-foreground border-border" },
+  };
+  const m = map[level];
+  return (
+    <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded-full border ${m.cls}`} data-testid="badge-confidence">
+      {m.label}
+    </span>
   );
 }
